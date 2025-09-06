@@ -32,14 +32,15 @@
 
 HardwareSerial QRcodeSerial(1);  // For QRCode scanner communication
 // Define the serial pins for the QRCode scanner
-#define QRCode_RX_PIN 14 
-#define QRCode_TX_PIN 13 
+#define QRCode_RX_PIN 14
+#define QRCode_TX_PIN 13
 
 HardwareSerial RFIDSerial(2);  // For RFID reader serial communication
 #define RFID_RX_PIN 32 
 #define RFID_TX_PIN 33 
 
 #define BUZZER_PIN 16
+
 #define ENTER_KEY_PIN 34
 
 Adafruit_MCP23X17 mcp;
@@ -138,7 +139,11 @@ const char* fileURL = "https://agkeze1.github.io/trupass_access_audio_files/acce
 // const char* fileURL = "https://raw.githubusercontent.com/agkeze1/trupass_access_audio_files/main/access_granted.wav";
 
 // SD Card access audio File Path
-const char* audioFilePath = "/audio/access_granted.wav"; // Change this to Device is ready for identification audio
+const char* accessGranted = "/audio/access_granted.wav"; 
+const char* accessDenied = "/audio/access_denied.wav"; 
+const char* accessDeniedFee = "/audio/access_denied_fee.wav"; 
+const char* deviceIsReadyAudio = "/audio/device_is_ready.wav"; 
+const char* networkFailedAudio = "/audio/network_failed.wav"; 
 
 unsigned long previousQRCodeScanMillis = 0; // Holds the last time in milliseconds a qrCode scan was done  
 unsigned long lastIdentificationTimeMillis = 0; // Holds the last time in milliseconds a scan was done  
@@ -154,7 +159,7 @@ const uint8_t COLS = 3;   // Three columns
 
 // Map keypad rows/cols to MCP pin numbers
 uint8_t rowPins[ROWS] = {0, 1, 2, 3};       // GPA0–GPA3
-uint8_t colPins[COLS] = {8, 9, 10};     // GPB0–GPB3
+uint8_t colPins[COLS] = {8, 9, 10};     // GPB0–GPB2
 
 char keys[ROWS][COLS] = {
   {'1', '2', '3'},
@@ -200,11 +205,10 @@ String passkey = ""; // Entered Passkey
 
 // ------- ENTER-KEY PRESS VARIABLE --------
 
-uint8_t  btnState = HIGH;     // last stable level
-constexpr uint32_t   DEBOUNCE_MS     = 30;  
-uint8_t  rawState;                 
-uint32_t lastEdgeMs    = 0;        // when the *stable* state last flipped
-bool pressHandled  = false;    // prevents double‑handling release
+#define DEBOUNCE_DELAY 50  
+
+unsigned long lastDebounceTime = 0;
+bool lastButtonState = HIGH;
 
 enum Screen {HOME, PASSKEY}; // Enum for device screens
 Screen currentScreen = HOME; // Active Device Screen (HOME is default)
@@ -271,7 +275,25 @@ struct WavHeader {
 };
 
 // ===== Setup I2S =====
+bool i2s_initialized = false;
+uint32_t current_sample_rate = 0;
+uint16_t current_channels = 0;
+
 void setupI2S(uint32_t sampleRate, int channels) {
+  // If already initialized with same config, just clear DMA and return
+  if (i2s_initialized && 
+      sampleRate == current_sample_rate && 
+      channels == current_channels) {
+    i2s_zero_dma_buffer(I2S_PORT);
+    return;
+  }
+
+  // If already initialized but config changed → uninstall old driver
+  if (i2s_initialized) {
+    i2s_driver_uninstall(I2S_PORT);
+    i2s_initialized = false;
+  }
+
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = sampleRate,
@@ -293,10 +315,18 @@ void setupI2S(uint32_t sampleRate, int channels) {
     .data_in_num = I2S_PIN_NO_CHANGE
   };
 
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pin_config);
-  i2s_zero_dma_buffer(I2S_PORT);
+  // Install new driver
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) == ESP_OK) {
+    i2s_set_pin(I2S_PORT, &pin_config);
+    i2s_zero_dma_buffer(I2S_PORT);
+    i2s_initialized = true;
+    current_sample_rate = sampleRate;
+    current_channels = channels;
+  } else {
+    Serial.println("I2S install failed!");
+  }
 }
+
 
 // --------- START FUNCTION PROTOTYPES -----------
 
@@ -326,7 +356,8 @@ void setup() {
   Serial.begin(115200); // Initialize Serial Monitor
   Wire.begin(21, 22);  // example: SDA=21, SCL=22
   RFIDSerial.begin(115200, SERIAL_8N1, RFID_RX_PIN, RFID_TX_PIN);  // Initialize RFID reader
-  QRcodeSerial.begin(9600, SERIAL_8N1, QRCode_RX_PIN, QRCode_TX_PIN);  // Initialize QRCode scanner
+  QRcodeSerial.begin(115200, SERIAL_8N1, QRCode_RX_PIN, QRCode_TX_PIN);  // Initialize QRCode scanner
+  SPI.begin(); // Init SPI bus  
 
   while (!SD.begin(SD_CS_PIN)) {
     Serial.println(F("SD Card initialization failed!"));
@@ -345,6 +376,8 @@ void setup() {
     Serial.println(F("SSD1306 OLED allocation failed"));
     for (;;);
   }
+
+  mcp.pinMode(8, OUTPUT);
 
   pinMode(BUZZER_PIN,OUTPUT);
   pinMode(OPEN_BOOM_BARRIER_RELAY_PIN, OUTPUT);
@@ -412,10 +445,10 @@ void setup() {
     }
 
     // Download access granted audio file
-    if (downloadAudioAndSaveToSD(fileURL, audioFilePath)) {
+    if (downloadAudioAndSaveToSD(fileURL, accessGranted)) {
       Serial.println(F("Access_granted audio file downloaded successfully!"));    
       
-      // playAudio(audioFilePath); // Play the downloaded file
+      // playAudio(accessGranted); // Play the downloaded file
         
     } else {
       Serial.println(F("Failed to download audio file."));
@@ -434,7 +467,7 @@ void setup() {
   delay(2000);
   displayHomeScreen();
 
-  playAudio(audioFilePath);
+  playAudio(deviceIsReadyAudio);
 
   beepBuzzer();
   
@@ -587,7 +620,7 @@ void ScanQRCode() {
         trimmedQRCodeData.toLowerCase();
         String qrCodeValue = trimmedQRCodeData.substring(3);
 
-        int residentIndex = trimmedQRCodeData.indexOf("tr:"); // Check if the scanned data contains "ta" prefix for resident scan"
+        int residentIndex = trimmedQRCodeData.indexOf("tr:"); // Check if the scanned data contains "tr" prefix for resident scan"
         int visitorIndex = trimmedQRCodeData.indexOf("tv:"); // Check if the scanned data contains "tv" prefix for visitor scan"
 
         if(residentIndex != -1) {
@@ -1279,7 +1312,7 @@ void validateResidentAccess(String accessCode, String epc) {
       Serial.println(plotId);
       if(residentPlotIsOwing(plotId)) { 
         // Play "Access denied, plot is owing" audio
-        playAccessDeniedPlotIsOwingAudio();
+        playAudio(accessDeniedFee);
 
         Serial.println(F("Access Denied, Plot is Owing!!!"));
 
@@ -1371,7 +1404,7 @@ void validateVisitorAccess(String accessCode) {
       Serial.println(F("Access Denied, Plot is Owing!!!"));
 
       // TODO: Play "Access denied plot is owing" audio
-      playAccessDeniedPlotIsOwingAudio();
+      playAudio(accessDeniedFee);
       delay(identificationDelayTime);
 
       return;
@@ -1418,7 +1451,7 @@ void validateAccess(String accessCode) {
 }
 
 void identificationSuccessful(){
-  playAccessGrantedAudio();
+  playAudio(accessGranted);
 
   Serial.println(F("Access Granted!"));     
   
@@ -1428,7 +1461,7 @@ void identificationSuccessful(){
 }
 
 void identificationFailed(){
-  playAccessDeniedAudio();
+  playAudio(accessDenied);
   delay(identificationDelayTime);
 }
 
@@ -1716,7 +1749,7 @@ void playAudio(const char *filename) {
   WavHeader header;
   file.read((uint8_t *)&header, sizeof(WavHeader));
 
-  // Print debug
+  // Debug info
   Serial.printf("Sample Rate: %lu Hz\n", header.sample_rate);
   Serial.printf("Channels: %u\n", header.channels);
   Serial.printf("Bits: %u\n", header.bits_per_sample);
@@ -1724,6 +1757,7 @@ void playAudio(const char *filename) {
 
   // Setup I2S
   setupI2S(header.sample_rate, header.channels);
+  i2s_zero_dma_buffer(I2S_PORT);
 
   // Buffers
   const size_t bufferSize = 512;
@@ -1739,7 +1773,8 @@ void playAudio(const char *filename) {
         // ===== Duplicate mono samples into stereo =====
         int16_t *samplesIn = (int16_t *)buffer;
         size_t sampleCount = bytesRead / 2;
-        static int16_t stereoBuffer[bufferSize];  // double size not needed, buffer is small
+
+        static int16_t stereoBuffer[bufferSize]; // 512 int16_t = 1024 bytes
         size_t stereoIndex = 0;
 
         for (size_t i = 0; i < sampleCount; i++) {
@@ -1748,7 +1783,12 @@ void playAudio(const char *filename) {
           stereoBuffer[stereoIndex++] = s;  // Right
         }
 
-        i2s_write(I2S_PORT, stereoBuffer, stereoIndex * 2, &bytesWritten, portMAX_DELAY);
+        esp_err_t err = i2s_write(I2S_PORT, stereoBuffer, stereoIndex * sizeof(int16_t), &bytesWritten, 100 / portTICK_PERIOD_MS);
+        if (err != ESP_OK) {
+          Serial.println("i2s_write timeout or error");
+          break; // exit playback loop to avoid infinite hang
+        }
+
       } else {
         // Stereo file, write directly
         i2s_write(I2S_PORT, buffer, bytesRead, &bytesWritten, portMAX_DELAY);
@@ -1760,12 +1800,6 @@ void playAudio(const char *filename) {
   Serial.println("Playback finished.");
 }
 
-void playAccessGrantedAudio(){
-}
-void playAccessDeniedAudio(){
-}
-void playAccessDeniedPlotIsOwingAudio(){
-}
 
 // MQTT CONFIGURATIONS
 
@@ -2181,21 +2215,40 @@ void handleEnterKeyPress(){
     return;
   }
 
-  rawState = digitalRead(ENTER_KEY_PIN);
+  beepBuzzer();
+  
+  bool reading = digitalRead(ENTER_KEY_PIN);
 
-  // ---------- debounce ----------
-  if (rawState != btnState && millis() - lastEdgeMs > DEBOUNCE_MS) {
-    btnState   = rawState;
-    lastEdgeMs = millis();
-    pressHandled = false;          // fresh edge detected
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
   }
 
-  // ---------- Enter key short press ----------
-  if (btnState == HIGH && !pressHandled) { 
-    Serial.println("Enter key short pressed!");
-    validateAccess(passkey);  
-    pressHandled = true;
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    if (reading == LOW && lastButtonState == HIGH) {
+      Serial.println("Enter key pressed!");
+      performAction();
+    }
   }
+
+  lastButtonState = reading;
+
+
+
+
+   bool reading = digitalRead(ENTER_BUTTON_PIN);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    if (reading == LOW && lastButtonState == HIGH) {
+      Serial.println("Enter key pressed!");
+      validateAccess(passkey); 
+    }
+  }
+
+  lastButtonState = reading;
 }
 
 // ---------- END HANDLERS FUNCTIONS -----------
